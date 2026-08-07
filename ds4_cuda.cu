@@ -9096,14 +9096,20 @@ static int attention_decode_score_split_launch(
         cudaGetDevice(&tile_dev);
         if (tile_dev >= 0 && tile_dev < DS4_MAX_GPUS &&
             !tile_shmem_ready[tile_dev]) {
-            if (!cuda_ok(cudaFuncSetAttribute(
-                             attention_decode_score_split_scores_tile512_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)tile_shmem),
-                         "attention score tile shared-memory opt-in")) {
+            int max_optin = 0;
+            if (cudaDeviceGetAttribute(&max_optin,
+                                       cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                       tile_dev) == cudaSuccess &&
+                max_optin >= (int)tile_shmem &&
+                cudaFuncSetAttribute(
+                    attention_decode_score_split_scores_tile512_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)tile_shmem) == cudaSuccess) {
+                tile_shmem_ready[tile_dev] = 1;
+            } else {
+                (void)cudaGetLastError();
                 score_tile_disabled = 1;
             }
-            tile_shmem_ready[tile_dev] = 1;
         }
         if (score_tile_disabled) {
             return 0; /* retry via the generic path on the next call */
@@ -17286,6 +17292,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     (int)tile_shmem),
                     "attention score rows shared-memory opt-in")) {
+                (void)cudaGetLastError();
                 return 0;
             }
             tile_shmem_ready[physical_device] = 1;
