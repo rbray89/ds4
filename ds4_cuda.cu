@@ -18232,6 +18232,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     }
 
     const __half *out_a_f16 = NULL;
+    bool out_a_stream_f16 = false;
     uint32_t out_a_cublas_min_tokens = 2u;
     const char *out_a_min_env = getenv("DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN");
     if (out_a_min_env && out_a_min_env[0]) {
@@ -18244,17 +18245,31 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         n_tokens >= out_a_cublas_min_tokens &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, physical_device, "attn_output_a");
+        if (!out_a_f16 && getenv("DS4_CUDA_NO_ATTN_A_STREAM_DEQUANT") == NULL) {
+            out_a_stream_f16 = true;
+        }
     }
-    if (out_a_f16) {
+    if (out_a_f16 || out_a_stream_f16) {
+        const uint64_t wh_bytes = out_a_stream_f16
+            ? (uint64_t)n_groups * rank * group_dim * sizeof(__half) : 0;
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
+        const uint64_t heads_h_offset = (wh_bytes + 255u) & ~255ull;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
-        const uint64_t low_tmp_offset = (heads_h_bytes + 255u) & ~255ull;
+        const uint64_t low_tmp_offset = (heads_h_offset + heads_h_bytes + 255u) & ~255ull;
         const uint64_t tmp_bytes = low_tmp_offset + low_tmp_count * sizeof(float);
         void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
-        __half *heads_h = (__half *)tmp;
+        __half *wh = out_a_stream_f16 ? (__half *)tmp : NULL;
+        __half *heads_h = (__half *)((char *)tmp + heads_h_offset);
         float *low_packed = (float *)((char *)tmp + low_tmp_offset);
+        const __half *out_a_f16_use = out_a_f16 ? out_a_f16 : wh;
+        if (out_a_stream_f16) {
+            const uint64_t total_blocks = (uint64_t)n_groups * rank * blocks_a;
+            q8_0_dequant_f16_kernel<<<((total_blocks * 2u + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+                    wh, out_a, total_blocks, (uint32_t)blocks_a, (uint32_t)group_dim);
+            if (!cuda_ok(cudaGetLastError(), "attention output a stream dequant")) return 0;
+        }
         attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256, 0, cuda_decode_stream()>>>(
                 heads_h,
                 (const float *)heads->ptr,
@@ -18271,11 +18286,11 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                        (int)n_tokens,
                                                        (int)group_dim,
                                                        &alpha,
-                                                       out_a_f16,
-                                                       CUDA_R_16F,
-                                                       (int)group_dim,
-                                                       (long long)rank * group_dim,
-                                                       heads_h,
+                                                        out_a_f16_use,
+                                                        CUDA_R_16F,
+                                                        (int)group_dim,
+                                                        (long long)rank * group_dim,
+                                                        heads_h,
                                                        CUDA_R_16F,
                                                        (int)group_dim,
                                                        (long long)n_tokens * group_dim,
