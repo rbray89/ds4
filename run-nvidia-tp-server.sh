@@ -5,13 +5,14 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$ROOT/$(basename -- "${BASH_SOURCE[0]}")"
 cd -- "$ROOT"
 
-MODEL="${DS4_MODEL:-/home/antirez/models/deepseek-v4-gguf/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf}"
+MODEL="${DS4_MODEL:-$ROOT/ds4flash.gguf}"
 CTX="${DS4_CTX:-100000}"
 SERVER_HOST="${DS4_SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${DS4_SERVER_PORT:-8000}"
-KV_DIR="${DS4_KV_DIR:-/data/ds4-kv}"
+KV_DIR="${DS4_KV_DIR:-$ROOT/kv}"
 KV_SPACE_MB="${DS4_KV_SPACE_MB:-8192}"
 BATCHED_SESSIONS="${DS4_BATCHED_SESSIONS:-16}"
+GPU_DEVICES="${DS4_GPU_DEVICES:-0,2,4,6,1,3,5,7}"
 LOCK_FILE="${DS4_LOCK_FILE:-/tmp/ds4.lock}"
 LOG_FILE="${DS4_SERVER_LOG:-/tmp/ds4-server.log}"
 START_TIMEOUT="${DS4_START_TIMEOUT:-180}"
@@ -125,10 +126,11 @@ stop_server() {
 
 run_server() {
     check_prerequisites
+    mkdir -p "$KV_DIR"
     exec ./ds4-server \
         --cuda \
         --cuda-tensor-parallel \
-        --gpu-devices 0,2,4,6,1,3,5,7 \
+        --gpu-devices "$GPU_DEVICES" \
         --gpu-vram auto \
         --model "$MODEL" \
         --ctx "$CTX" \
