@@ -1114,6 +1114,27 @@ static int cuda_use_mmq(void) {
     return use;
 }
 
+/* Dense Q8_0 mmq prefill tier on multi-GPU CUDA TP. The routed-MoE mmq
+ * tier stays disabled on multi-GPU because those kernels expect a single
+ * device to hold the full expert set; the dense path resolves the active
+ * device on every call and is safe across tiers, so keep the tensor-core
+ * fused-dequant path for the dense weights that dominate prefill. */
+static int cuda_use_mmq_dense(void) {
+    if (cuda_use_mmq()) return 1;
+    if (g_quality_mode || g_n_gpus <= 1) return 0;
+    static int init = 0, use = 0;
+    if (!init) {
+        init = 1;
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && ds4_mmq_init(dev) == 0) {
+            use = 1;
+        } else {
+            fprintf(stderr, "ds4: ds4_mmq_init failed - multi-GPU dense mmq disabled\n");
+        }
+    }
+    return use;
+}
+
 /* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
  * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
  * resolves the active CUDA device on every call; initialization only warms
@@ -14505,7 +14526,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * layout (the GGUF on-disk format).  K must be a multiple of 256;
      * every Q8_0 weight in V4 Flash satisfies this, odd shapes fall
      * through to the legacy paths. */
-    if (n_tok > 1 && (in_dim % 256u) == 0 && cuda_use_mmq()) {
+    if (n_tok > 1 && (in_dim % 256u) == 0 && cuda_use_mmq_dense()) {
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
                                     (cudaStream_t)0);
