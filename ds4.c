@@ -14957,6 +14957,20 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 #define DS4_GPU_GLM_COMPACT_CACHE_F16 DS4_GPU_ATTN_COMP_CACHE_F16
 
+/* CUDA can opt the compressed attention KV cache into F16 storage at runtime
+ * (DS4_CUDA_F16_COMP_KV=1) to halve the context-scaling KV footprint. Apple
+ * Metal always uses F16. The compressor still pools/normalizes/RoPEs/FP8-
+ * rounds rows in F32 staging; only the stored rows are F16. */
+static int ds4_attn_comp_cache_f16(void) {
+#if defined(__APPLE__)
+    return 1;
+#else
+    return DS4_GPU_ATTN_COMP_CACHE_F16 ||
+           (getenv("DS4_CUDA_F16_COMP_KV") != NULL &&
+            getenv("DS4_CUDA_F16_COMP_KV")[0] != '0');
+#endif
+}
+
 /* =========================================================================
  * Metal Release Graph State.
  * =========================================================================
@@ -16111,7 +16125,7 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
         bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+                 (ds4_attn_comp_cache_f16() ? sizeof(uint16_t) : sizeof(float));
         if (ratio == 4) {
             bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         }
@@ -17104,13 +17118,13 @@ static bool metal_graph_alloc_raw_cap(
                     managed_kv_cache,
                     layer_tier,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+                    (ds4_attn_comp_cache_f16() ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tp_partner,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                        (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+                        (ds4_attn_comp_cache_f16() ? sizeof(uint16_t) : sizeof(float)));
             }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
@@ -19967,11 +19981,11 @@ static bool metal_graph_decode_kv_store(
 
 static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
     return (uint64_t)DS4_N_HEAD_DIM *
-           (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+           (ds4_attn_comp_cache_f16() ? sizeof(uint16_t) : sizeof(float));
 }
 
 static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
+    return ds4_attn_comp_cache_f16() ? 1u : 0u;
 }
 
 static bool metal_graph_store_attn_comp_stage(
@@ -22306,7 +22320,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         DS4_RMS_EPS,
                                                         comp_state_already_stored) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("compressor_update");
-        if (ok && emit) {
+        if (ok && emit && !metal_graph_attn_comp_cache_is_f16()) {
             ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
             if (!comp_row_view) {
                 ok = false;
@@ -27980,7 +27994,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
                                                             false) != 0;
-                    if (ok && emit) {
+                    if (ok && emit && !metal_graph_attn_comp_cache_is_f16()) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
@@ -35504,7 +35518,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
             m.compressed_bytes += (uint64_t)layer_comp_cap *
                                   DS4_N_HEAD_DIM *
-                                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+                                  (ds4_attn_comp_cache_f16() ? sizeof(uint16_t) : sizeof(float));
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -47754,13 +47768,14 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
     const uint32_t raw_cap = engine_planner_raw_cap((int)ctx, prefill_cap);
     size_t bytes = (size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
 
-    /* Compressed + indexer for ratio != 0 layers. Uses sizeof(float)
-     * unconditionally (over-estimates on Apple Metal F16 cache, which
-     * is the desired conservative posture per spec criterion 8). */
+    /* Compressed + indexer for ratio != 0 layers. The compressed cache is
+     * stored in F16 when the runtime flag is active, so size it accordingly;
+     * otherwise over-estimating as F32 is the conservative posture. */
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     if (ratio != 0) {
         const uint32_t layer_comp_cap = ctx / ratio + 2u;
-        bytes += (size_t)layer_comp_cap * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += (size_t)layer_comp_cap * DS4_N_HEAD_DIM *
+                 (ds4_attn_comp_cache_f16() ? sizeof(uint16_t) : sizeof(float));
         if (ratio == 4) {
             bytes += (size_t)layer_comp_cap * DS4_N_INDEXER_HEAD_DIM *
                      sizeof(float);
@@ -49387,7 +49402,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (ds4_attn_comp_cache_f16()) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -49801,7 +49816,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (ds4_attn_comp_cache_f16()) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,
@@ -50451,7 +50466,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (ds4_attn_comp_cache_f16()) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -50983,7 +50998,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (ds4_attn_comp_cache_f16()) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,
