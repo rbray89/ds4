@@ -26311,6 +26311,34 @@ static void metal_graph_dspark_capture_begin_prefill(ds4_gpu_graph *g) {
     metal_graph_dspark_capture_invalidate(g);
 }
 
+/* DSpark capture runs on the target layer's home tier while the captured
+ * hidden states live on tier 0. A raw kernel deref across that cross-NUMA
+ * pair faults on Turing, so compute into a local buffer on the source tier
+ * and move the result via copy_xdev (cudaMemcpyPeerAsync / host bounce) --
+ * the only cross-NUMA data path that is reliable on this hardware. */
+static bool metal_graph_dspark_capture_weighted_sum(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_embd,
+        uint32_t              n_hc) {
+    const int dst_tier = dst ? dst->device_id : -1;
+    const int hc_tier  = hc ? hc->device_id : -1;
+    if (g_n_gpus <= 1 || dst_tier < 0 || hc_tier < 0 ||
+        dst_tier == hc_tier) {
+        return ds4_gpu_hc_weighted_sum_tensor(dst, hc, weights, n_embd, n_hc) != 0;
+    }
+    const uint32_t n_tokens = (uint32_t)(dst->bytes / ((uint64_t)n_embd * sizeof(float)));
+    if (n_tokens == 0) return false;
+    const uint64_t bytes = (uint64_t)n_tokens * n_embd * sizeof(float);
+    ds4_gpu_tensor *local = ds4_gpu_tensor_alloc_ptr_on(hc_tier, bytes);
+    if (!local) return false;
+    bool ok = ds4_gpu_hc_weighted_sum_tensor(local, hc, weights, n_embd, n_hc) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy_xdev(dst, local, bytes) != 0;
+    ds4_gpu_tensor_free(local);
+    return ok;
+}
+
 static bool metal_graph_dspark_capture_hc(
         ds4_gpu_graph       *g,
         const ds4_gpu_tensor *hc,
@@ -26326,11 +26354,8 @@ static bool metal_graph_dspark_capture_hc(
                             (uint64_t)slot * DS4_N_EMBD * sizeof(float),
                             (uint64_t)DS4_N_EMBD * sizeof(float));
     if (!dst) return false;
-    const bool ok = ds4_gpu_hc_weighted_sum_tensor(dst,
-                                                   hc,
-                                                   g->dspark_hc_mean_weights,
-                                                   DS4_N_EMBD,
-                                                   DS4_N_HC) != 0;
+    const bool ok = metal_graph_dspark_capture_weighted_sum(
+            dst, hc, g->dspark_hc_mean_weights, DS4_N_EMBD, DS4_N_HC);
     ds4_gpu_tensor_free(dst);
     if (ok) metal_graph_dspark_capture_note_slot(g, slot);
     return ok;
@@ -26396,11 +26421,7 @@ static bool metal_graph_dspark_capture_prefill_layer(
                                 (uint64_t)slot * embd_bytes,
                                 embd_bytes);
         bool ok = batch_dst && last_src && last_dst &&
-                  ds4_gpu_hc_weighted_sum_tensor(batch_dst,
-                                                 metal_graph_batch_cur_hc(g),
-                                                 g->dspark_hc_mean_rows,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_HC) != 0 &&
+                  metal_graph_dspark_capture_weighted_sum(batch_dst, metal_graph_batch_cur_hc(g), g->dspark_hc_mean_rows, DS4_N_EMBD, DS4_N_HC) &&
                   ds4_gpu_tensor_copy(last_dst,
                                       0,
                                       last_src,
@@ -26457,11 +26478,7 @@ static bool metal_graph_dspark_capture_prefill_rows(
                               row0) * DS4_N_EMBD) * sizeof(float),
                             (uint64_t)n_tokens * embd_bytes);
     bool ok = batch_dst &&
-              ds4_gpu_hc_weighted_sum_tensor(batch_dst,
-                                             metal_graph_batch_cur_hc(g),
-                                             g->dspark_hc_mean_rows,
-                                             DS4_N_EMBD,
-                                             DS4_N_HC) != 0;
+              metal_graph_dspark_capture_weighted_sum(batch_dst, metal_graph_batch_cur_hc(g), g->dspark_hc_mean_rows, DS4_N_EMBD, DS4_N_HC);
     if (!ok) fprintf(stderr, "ds4: pipeline capture rows FAIL il=%u row0=%u n=%u dst=%d\n",
                      il, row0, n_tokens, batch_dst != NULL);
     if (ok && row0 + n_tokens == chunk_len) {
@@ -26569,11 +26586,7 @@ static bool metal_graph_dspark_capture_verified_suffix_layer(
                             (uint64_t)(uint32_t)slot * embd_bytes,
                             embd_bytes);
     bool ok = batch_dst && last_src && last_dst &&
-              ds4_gpu_hc_weighted_sum_tensor(batch_dst,
-                                             metal_graph_batch_cur_hc(g),
-                                             g->dspark_hc_mean_rows,
-                                             DS4_N_EMBD,
-                                             DS4_N_HC) != 0 &&
+              metal_graph_dspark_capture_weighted_sum(batch_dst, metal_graph_batch_cur_hc(g), g->dspark_hc_mean_rows, DS4_N_EMBD, DS4_N_HC) &&
               ds4_gpu_tensor_copy(last_dst,
                                   0,
                                   last_src,
