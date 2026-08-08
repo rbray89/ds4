@@ -15238,6 +15238,7 @@ typedef struct {
     bool cuda_tp_q;
     bool cuda_tp_output;
     bool cuda_tp_prefill_ffn;
+    bool dspark_stage_active;
     bool cuda_tp_prefill_attn_output;
     bool cuda_q_norm_rope_fuse;
     bool cuda_qkv_kv_rope_fuse;
@@ -29392,7 +29393,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->tp_world == 2 &&
         g->tp_batch_out && g->tp_batch_in;
     const bool cuda_tp_owned_batch_moe =
-        g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
+        g->cuda_tp_ep && g->cuda_tp_prefill_ffn && !g->dspark_stage_active;
     if (ok && cuda_tp_owned_batch_moe) {
         ok = metal_graph_encode_mixed_routed_rows(
                 g, decode_items, decode_count, model, layer, il, n_tokens);
@@ -31649,6 +31650,7 @@ static bool metal_graph_eval_dspark_stage_block(
                                                  DS4_N_HC) != 0;
     DS4_DSPARK_PROFILE_STAGE("attn_output_hc");
 
+    g->dspark_stage_active = 1;
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
                                                      dspark_model,
                                                      block,
@@ -31657,6 +31659,7 @@ static bool metal_graph_eval_dspark_stage_block(
                                                      draft,
                                                      NULL,
                                                      0);
+    g->dspark_stage_active = 0;
     DS4_DSPARK_PROFILE_STAGE("ffn");
     if (ok &&
         !prepare_next_stage_input &&

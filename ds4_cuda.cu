@@ -1144,6 +1144,27 @@ static int cuda_attn_comp_f16(void) {
     return s && s[0] && s[0] != '0';
 }
 
+/* The plain (non-owned) IQ2_XXS/Q2_K routed-MoE mmq tier on multi-GPU CUDA
+ * TP. The TP-split main model uses the owned variant (half-resident experts);
+ * this plain call carries the FULL expert set resident on a single device --
+ * the DSpark draft executor -- which is exactly the single-device case the
+ * mmq kernels handle. */
+static int cuda_use_mmq_moe(void) {
+    if (cuda_use_mmq()) return 1;
+    if (g_quality_mode || g_n_gpus <= 1) return 0;
+    static int init = 0, use = 0;
+    if (!init) {
+        init = 1;
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && ds4_mmq_init(dev) == 0) {
+            use = 1;
+        } else {
+            fprintf(stderr, "ds4: ds4_mmq_init failed - multi-GPU MoE mmq disabled\n");
+        }
+    }
+    return use;
+}
+
 /* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
  * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
  * resolves the active CUDA device on every call; initialization only warms
@@ -24097,7 +24118,7 @@ static int routed_moe_launch(
      * [n_tokens, n_expert, *] by the validation above.  Any entry
      * failure falls through to the legacy sorted-pairs path (the
      * buffers are scratch there too). */
-    if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq()) {
+    if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq_moe()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
         const int mmq_tier = ds4_tensor_device_idx(out);
