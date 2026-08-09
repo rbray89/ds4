@@ -32046,13 +32046,8 @@ static bool metal_graph_eval_dspark_base_logits(
                                                       DS4_N_EMBD,
                                                       draft,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(logits,
-                                                  base_model,
-                                                  base_weights->output,
-                                                  DS4_N_EMBD,
-                                                  vocab_dim,
-                                                  output_norm,
-                                                  draft);
+    if (ok) ok = metal_graph_output_logits_head_matmul(
+            g, base_model, base_weights, output_norm, logits, draft, vocab_dim);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (!ok) (void)ds4_gpu_synchronize();
 
