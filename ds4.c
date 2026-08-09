@@ -32213,13 +32213,9 @@ static bool metal_graph_eval_dspark_base_logits_from_hidden(
                                 DS4_N_VOCAB * sizeof(float));
     bool ok = output_norm && logits;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(logits,
-                                                  base_model,
-                                                  base_weights->output,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_VOCAB,
-                                                  output_norm,
-                                                  dw->block_size);
+    if (ok) ok = metal_graph_output_logits_head_matmul(
+            g, base_model, base_weights, output_norm, logits,
+            dw->block_size, DS4_N_VOCAB);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (!ok) (void)ds4_gpu_synchronize();
 
@@ -60091,9 +60087,9 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                     &s->engine->mtp_model,
                                                     dw,
                                                     token,
-                                                    s->dspark_conf_features,
-                                                    s->dspark_conf_features_cap,
-                                                    &confidence0);
+                    s->dspark_conf_features,
+                    s->dspark_conf_features_cap,
+                    &confidence0);
                 DS4_DSPARK_PROP_ADD(propose_conf0_ms, conf0_t0);
             }
             if (conf0_ok) {
